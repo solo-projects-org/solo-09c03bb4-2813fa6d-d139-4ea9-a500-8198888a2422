@@ -10,8 +10,13 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from . import hll
-from .store import ConflictError, MonthlySummary, Storage
+from . import audit, hll
+from .store import (
+    ConflictError,
+    MonthlySummary,
+    Storage,
+    TestListConflictError,
+)
 
 DAY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
@@ -36,6 +41,7 @@ class SketchSubmission(BaseModel):
                 "revision": 1,
                 "p": 4,
                 "registers": [0, 3, 0, 5, 1, 0, 0, 2, 0, 4, 0, 0, 1, 0, 0, 0],
+                "test_list_confirmed": False,
             }
         },
     )
@@ -48,6 +54,18 @@ class SketchSubmission(BaseModel):
         list[Annotated[int, Field(strict=True)]],
         Field(description="exactly 2**p registers"),
     ]
+    test_list_confirmed: Annotated[
+        bool,
+        Field(
+            strict=True,
+            description=(
+                "Venue confirms this revision was rebuilt without the month's "
+                "registered test-swipe tickets. Stored only when a new "
+                "revision is written (created/replaced); valid for that "
+                "revision only."
+            ),
+        ),
+    ] = False
 
     @field_validator("venue_id")
     @classmethod
@@ -75,6 +93,7 @@ class SketchResponse(BaseModel):
     p: int
     registers: list[int]
     updated_at: str
+    test_list_confirmed: bool
 
 
 class IngestResponse(BaseModel):
@@ -84,6 +103,7 @@ class IngestResponse(BaseModel):
     revision: int
     current_revision: int
     month: str
+    test_list_confirmed: bool
 
 
 class MonthlyReport(BaseModel):
@@ -94,6 +114,72 @@ class MonthlyReport(BaseModel):
     day_count: int
     venue_count: int
     updated_at: str
+
+
+class TestListSubmission(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {"tickets": ["TEST-SWIPE-0001", "TEST-SWIPE-0002"]}
+        },
+    )
+
+    tickets: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=128)]],
+        Field(
+            min_length=1,
+            max_length=10_000,
+            description=(
+                "Test-swipe ticket ids for the month. Duplicates are removed "
+                "and the list is stored sorted."
+            ),
+        ),
+    ]
+
+
+class TestListResponse(BaseModel):
+    month: str
+    status: str  # created | unchanged
+    ticket_count: int
+    updated_at: str
+
+
+class TestListView(BaseModel):
+    month: str
+    tickets: list[str]
+    ticket_count: int
+    updated_at: str
+
+
+class AuditSourceView(BaseModel):
+    """One venue/day whose daily register reaches the monthly bucket value."""
+
+    venue_id: str
+    day: str
+    revision: int
+    p: int
+    day_bucket: int
+    day_value: int
+    matched_ticket: str | None
+
+
+class BucketFailureView(BaseModel):
+    bucket: int
+    month_value: int
+    re_report: list[AuditSourceView]
+
+
+class MonthlyAuditResponse(BaseModel):
+    month: str
+    status: str  # passed | failed
+    list_ticket_count: int
+    list_updated_at: str
+    buckets_nonempty: int
+    buckets_failed: int
+    failures: list[BucketFailureView]
+    report: MonthlyReport | None = Field(
+        description="The monthly report, present only when every bucket passes"
+    )
 
 
 class HealthResponse(BaseModel):
@@ -148,12 +234,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Museum Combined-Ticket Dedup Service",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Venues submit daily HyperLogLog sketches of combined-ticket ids. "
             "Identical tickets scanned at several venues are counted once. "
             "Monthly reports are served from a persisted summary that is "
-            "rebuilt transactionally from the current daily sketches."
+            "rebuilt transactionally from the current daily sketches. "
+            "Before a report goes to the statistics group, it can be audited "
+            "against the month's registered test-swipe ticket list: buckets "
+            "explainable only by test swipes must be re-reported by the "
+            "venue with a confirmed rebuild."
         ),
         lifespan=lifespan,
     )
@@ -204,6 +294,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 revision=submission.revision,
                 p=submission.p,
                 registers=clean,
+                test_list_confirmed=submission.test_list_confirmed,
             )
         except ConflictError as exc:
             raise HTTPException(
@@ -224,6 +315,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             revision=outcome.revision,
             current_revision=outcome.current_revision,
             month=outcome.month,
+            test_list_confirmed=outcome.test_list_confirmed,
         )
 
     @app.get(
@@ -244,6 +336,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             p=stored.p,
             registers=stored.registers,
             updated_at=stored.updated_at,
+            test_list_confirmed=stored.test_list_confirmed,
         )
 
     @app.get(
@@ -258,6 +351,108 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if summary is None:
             raise HTTPException(status_code=404, detail=f"no summary for {month}")
         return _report(summary)
+
+    @app.put(
+        "/api/v1/test-tickets/{month}",
+        response_model=TestListResponse,
+        tags=["test-tickets"],
+        summary="Register the month's fixed test-swipe ticket list",
+        responses={
+            409: {"description": "A different list is already registered"},
+            422: {"description": "Malformed month or ticket list"},
+        },
+    )
+    def register_test_list(
+        month: str, submission: TestListSubmission, storage: StorageDep
+    ) -> TestListResponse:
+        _validate_month(month)
+        try:
+            outcome = storage.register_test_list(month, submission.tickets)
+        except TestListConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "test_list_conflict", "message": str(exc)},
+            ) from exc
+        return TestListResponse(
+            month=outcome.month,
+            status=outcome.status,
+            ticket_count=outcome.ticket_count,
+            updated_at=outcome.updated_at,
+        )
+
+    @app.get(
+        "/api/v1/test-tickets/{month}",
+        response_model=TestListView,
+        tags=["test-tickets"],
+        summary="Read the registered test-swipe ticket list",
+    )
+    def read_test_list(month: str, storage: StorageDep) -> TestListView:
+        _validate_month(month)
+        stored = storage.get_test_list(month)
+        if stored is None:
+            raise HTTPException(
+                status_code=404, detail=f"no test-swipe list for {month}"
+            )
+        return TestListView(
+            month=stored.month,
+            tickets=stored.tickets,
+            ticket_count=len(stored.tickets),
+            updated_at=stored.updated_at,
+        )
+
+    @app.get(
+        "/api/v1/reports/monthly/{month}/audit",
+        response_model=MonthlyAuditResponse,
+        tags=["reports"],
+        summary=(
+            "Audit the monthly summary against the registered test-swipe "
+            "list; the report is returned only when every bucket passes"
+        ),
+        responses={
+            404: {"description": "No monthly summary or no registered list"},
+        },
+    )
+    def audit_monthly(month: str, storage: StorageDep) -> MonthlyAuditResponse:
+        _validate_month(month)
+        snapshot = storage.get_audit_snapshot(month)
+        if snapshot.summary is None:
+            raise HTTPException(status_code=404, detail=f"no summary for {month}")
+        if snapshot.test_list is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no test-swipe list registered for {month}",
+            )
+        result = audit.audit_month(
+            snapshot.summary, snapshot.dailies, snapshot.test_list.tickets
+        )
+        return MonthlyAuditResponse(
+            month=result.month,
+            status=result.status,
+            list_ticket_count=len(snapshot.test_list.tickets),
+            list_updated_at=snapshot.test_list.updated_at,
+            buckets_nonempty=result.buckets_nonempty,
+            buckets_failed=result.buckets_failed,
+            failures=[
+                BucketFailureView(
+                    bucket=failure.bucket,
+                    month_value=failure.month_value,
+                    re_report=[
+                        AuditSourceView(
+                            venue_id=source.venue_id,
+                            day=source.day,
+                            revision=source.revision,
+                            p=source.p,
+                            day_bucket=source.day_bucket,
+                            day_value=source.day_value,
+                            matched_ticket=source.matched_ticket,
+                        )
+                        for source in failure.sources
+                    ],
+                )
+                for failure in result.failures
+            ],
+            report=_report(snapshot.summary) if result.status == "passed" else None,
+        )
 
     return app
 

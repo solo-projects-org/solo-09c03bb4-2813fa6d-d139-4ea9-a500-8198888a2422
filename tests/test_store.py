@@ -172,7 +172,7 @@ def test_concurrent_backfills_never_lose_a_current_sketch(storage):
                 8,
                 sketch([f"{venues[index]}-ticket"], 8),
             )
-        except BaseException as exc:  # pragma: no cover - surfaced below
+        except BaseException as exc:  # noqa: BLE001  # pragma: no cover - surfaced below
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(venues))]
@@ -197,7 +197,7 @@ def test_concurrent_corrections_converge(storage):
     def worker(n: int) -> None:
         try:
             storage.ingest("v1", "2026-11-03", 2, 8, sketch([f"t{n}"], 8))
-        except BaseException as exc:  # pragma: no cover
+        except BaseException as exc:  # noqa: BLE001  # pragma: no cover
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]

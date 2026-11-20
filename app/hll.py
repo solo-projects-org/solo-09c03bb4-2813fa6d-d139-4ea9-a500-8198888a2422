@@ -35,8 +35,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Iterable, Sequence
 
 MASK64 = (1 << 64) - 1
 TWO_64 = 1 << 64
@@ -130,8 +130,7 @@ def build_sketch(ticket_hashes: Iterable[int], p: int) -> list[int]:
             rho = remaining_bits + 1
         else:
             rho = remaining_bits - remainder.bit_length() + 1
-        if rho > registers[bucket]:
-            registers[bucket] = rho
+        registers[bucket] = max(registers[bucket], rho)
     return registers
 
 
@@ -158,7 +157,7 @@ def merge_sketches(sketches: Sequence[tuple[int, Sequence[int]]]) -> list[int]:
         validate_precision(p)
         validate_registers(p, registers)
         if p == target_p:
-            merged = [a if a >= b else b for a, b in zip(merged, registers)]
+            merged = [max(a, b) for a, b in zip(merged, registers)]
             continue
 
         shift = p - target_p
@@ -175,8 +174,7 @@ def merge_sketches(sketches: Sequence[tuple[int, Sequence[int]]]) -> list[int]:
                 # longer matters.
                 contribution = shift - offset.bit_length() + 1
             target = index >> shift
-            if contribution > merged[target]:
-                merged[target] = contribution
+            merged[target] = max(merged[target], contribution)
 
     limit = max_rho(target_p)
     for index, value in enumerate(merged):

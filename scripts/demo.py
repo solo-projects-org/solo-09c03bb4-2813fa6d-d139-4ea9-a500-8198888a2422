@@ -37,8 +37,7 @@ def sketch(tickets: list[str], p: int) -> list[int]:
         hashed = hash_ticket(ticket)
         bucket = hashed >> bits
         value = rho(hashed & ((1 << bits) - 1), bits)
-        if value > registers[bucket]:
-            registers[bucket] = value
+        registers[bucket] = max(registers[bucket], value)
     return registers
 
 

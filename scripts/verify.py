@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """End-to-end evidence run against a live service (standard library only).
 
-Covers the four acceptance points that need a real process:
+Covers the acceptance points that need a real process:
 
 1. monthly registers equal a fresh table built from the union of ticket ids at
    the month's lowest precision (cross-venue dedup);
 2. a correction can raise the month precision and shrink registers;
 3. concurrent backfills from many threads never drop a current sketch;
-4. the last successful summary survives a process restart.
+4. the test-swipe audit blocks a test-explained bucket until the venue
+   re-reports with a confirmed rebuild, then releases the monthly report;
+5. a monthly maximum tied between two venues is re-attributed as the sources
+   change revision, and passes only once every tied source is confirmed.
 
 Run with an empty database::
 
@@ -58,18 +61,17 @@ def call(method: str, path: str, body=None):
         return exc.code, json.loads(exc.read())
 
 
-def submit(venue, day, revision, p, registers):
-    return call(
-        "POST",
-        "/api/v1/daily-sketches",
-        {
-            "venue_id": venue,
-            "day": day,
-            "revision": revision,
-            "p": p,
-            "registers": registers,
-        },
-    )
+def submit(venue, day, revision, p, registers, confirmed=None):
+    body = {
+        "venue_id": venue,
+        "day": day,
+        "revision": revision,
+        "p": p,
+        "registers": registers,
+    }
+    if confirmed is not None:
+        body["test_list_confirmed"] = confirmed
+    return call("POST", "/api/v1/daily-sketches", body)
 
 
 def main() -> int:
@@ -146,6 +148,106 @@ def main() -> int:
     check(
         "concurrent summary registers equal fresh rebuild",
         report["registers"] == expected_race,
+    )
+
+    # 4. test-swipe audit: register the month's list, fail on a test-explained
+    # bucket, re-report with a confirmed rebuild, then the report is released.
+    TEST = "TEST-SWIPE-0001"
+    status, body = call("PUT", "/api/v1/test-tickets/2026-08", {"tickets": [TEST]})
+    check(
+        "test-swipe list registered for 2026-08",
+        status == 200 and body["status"] == "created" and body["ticket_count"] == 1,
+        f"{status} {body}",
+    )
+    status, body = call("PUT", "/api/v1/test-tickets/2026-08", {"tickets": [TEST]})
+    check("re-registering the same list is idempotent", body["status"] == "unchanged")
+    status, body = call(
+        "PUT", "/api/v1/test-tickets/2026-08", {"tickets": [TEST, "OTHER"]}
+    )
+    check("a different list for the same month conflicts", status == 409)
+    status, body = call("GET", "/api/v1/test-tickets/2026-08")
+    check("test-swipe list read back", status == 200 and body["tickets"] == [TEST])
+
+    real_t1 = [f"T1-REAL-{i:03d}" for i in range(30)]
+    submit("venue-t1", "2026-08-03", 1, 8, sketch([TEST] + real_t1, 8))
+    status, audit = call("GET", "/api/v1/reports/monthly/2026-08/audit")
+    entries = [e for f in audit.get("failures", []) for e in f["re_report"]]
+    check(
+        "audit fails and names venue/day/current revision to re-report",
+        status == 200
+        and audit["status"] == "failed"
+        and audit["report"] is None
+        and entries
+        and all(
+            e["venue_id"] == "venue-t1"
+            and e["day"] == "2026-08-03"
+            and e["revision"] == 1
+            and e["matched_ticket"] == TEST
+            for e in entries
+        ),
+        f"failures={audit.get('failures')}",
+    )
+    status, body = submit(
+        "venue-t1", "2026-08-03", 2, 8, sketch(real_t1, 8), confirmed=True
+    )
+    check(
+        "confirmed rebuild accepted and stored with the new revision",
+        status == 200
+        and body["status"] == "replaced"
+        and body["test_list_confirmed"] is True,
+        f"{status} {body}",
+    )
+    status, audit = call("GET", "/api/v1/reports/monthly/2026-08/audit")
+    check(
+        "audit passes after the confirmed rebuild and returns the report",
+        status == 200
+        and audit["status"] == "passed"
+        and audit["report"] is not None
+        and abs(audit["report"]["estimate"] - 30) <= 6,
+        f"estimate={audit.get('report', {}).get('estimate')}",
+    )
+
+    # 5. tied maximum: two venues explain the same monthly bucket with the same
+    # test swipe; the source set is re-attributed as revisions change.
+    test_bucket = hash_ticket(TEST) >> (64 - 8)
+    real_x = [f"REALX-{i}" for i in range(3)]
+    real_y = [f"REALY-{i}" for i in range(3)]
+    check(  # fixture sanity: the rebuilds must not re-enter the tied bucket
+        "local fixtures keep the rebuilt sketches out of the test bucket",
+        sketch(real_x, 8)[test_bucket] == 0 and sketch(real_y, 8)[test_bucket] == 0,
+    )
+    call("PUT", "/api/v1/test-tickets/2026-09", {"tickets": [TEST]})
+    submit("venue-x", "2026-09-01", 1, 8, sketch([TEST], 8))
+    submit("venue-y", "2026-09-02", 1, 8, sketch([TEST], 8))
+    _, audit = call("GET", "/api/v1/reports/monthly/2026-09/audit")
+    check(
+        "tied maximum lists both venues on the same bucket",
+        audit["status"] == "failed"
+        and len(audit["failures"]) == 1
+        and {s["venue_id"] for s in audit["failures"][0]["re_report"]}
+        == {"venue-x", "venue-y"},
+        f"failures={audit.get('failures')}",
+    )
+    submit("venue-x", "2026-09-01", 2, 8, sketch(real_x, 8), confirmed=True)
+    _, audit = call("GET", "/api/v1/reports/monthly/2026-09/audit")
+    remaining = [
+        (s["venue_id"], s["revision"])
+        for f in audit["failures"]
+        for s in f["re_report"]
+    ]
+    check(
+        "after venue-x changes revision, only venue-y remains on the bucket",
+        audit["status"] == "failed" and remaining == [("venue-y", 1)],
+        f"remaining={remaining}",
+    )
+    submit("venue-y", "2026-09-02", 2, 8, sketch(real_y, 8), confirmed=True)
+    _, audit = call("GET", "/api/v1/reports/monthly/2026-09/audit")
+    check(
+        "all tied sources confirmed: audit passes and returns the report",
+        audit["status"] == "passed"
+        and audit["report"] is not None
+        and abs(audit["report"]["estimate"] - 6) <= 2,
+        f"estimate={audit.get('report', {}).get('estimate')}",
     )
 
     print()

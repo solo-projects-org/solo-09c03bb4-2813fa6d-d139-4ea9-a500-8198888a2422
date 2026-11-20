@@ -10,17 +10,26 @@ Invariants
 * A correction always recomputes the month from scratch, so raising the
   minimum precision or lowering register values is reflected instead of being
   frozen into an incrementally merged summary.
+* A ``test_list_confirmed`` flag is stored only together with a newly written
+  revision (created or replaced).  It certifies that this revision was rebuilt
+  without the month's registered test-swipe tickets, and it never carries over
+  to a later revision.
+* The monthly audit reads the summary, the current daily sketches, and the
+  registered test list inside one deferred read transaction, so its verdict
+  and the report it may release come from the same committed snapshot while
+  holding no write lock.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterator, Sequence
+from datetime import UTC, datetime
 
 from . import hll
 
@@ -37,6 +46,7 @@ class DailySketch:
     registers: list[int]
     content_hash: str
     updated_at: str
+    test_list_confirmed: bool
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,31 @@ class IngestOutcome:
     current_revision: int
     month: str
     summary: MonthlySummary | None
+    test_list_confirmed: bool  # the flag as stored for the current revision
+
+
+@dataclass(frozen=True)
+class TestList:
+    month: str
+    tickets: list[str]
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class TestListOutcome:
+    status: str  # created | unchanged
+    month: str
+    ticket_count: int
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AuditSnapshot:
+    """One committed view of everything the monthly audit needs."""
+
+    summary: MonthlySummary | None
+    dailies: list[DailySketch]
+    test_list: TestList | None
 
 
 class ConflictError(Exception):
@@ -73,6 +108,17 @@ class ConflictError(Exception):
         self.current_revision = current_revision
 
 
+class TestListConflictError(Exception):
+    """A different test-swipe list is already registered for the month."""
+
+    def __init__(self, month: str):
+        super().__init__(
+            f"a different test-swipe list is already registered for {month}; "
+            "the monthly list is fixed once registered"
+        )
+        self.month = month
+
+
 def month_of(day: str) -> str:
     return day[:7]
 
@@ -85,7 +131,7 @@ def next_month(month: str) -> str:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 def content_fingerprint(p: int, registers: Sequence[int]) -> str:
@@ -122,13 +168,14 @@ class Storage:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS daily_sketch (
-                    venue_id      TEXT    NOT NULL,
-                    day           TEXT    NOT NULL,
-                    revision      INTEGER NOT NULL,
-                    p             INTEGER NOT NULL,
-                    registers     BLOB    NOT NULL,
-                    content_hash  TEXT    NOT NULL,
-                    updated_at    TEXT    NOT NULL,
+                    venue_id             TEXT    NOT NULL,
+                    day                  TEXT    NOT NULL,
+                    revision             INTEGER NOT NULL,
+                    p                    INTEGER NOT NULL,
+                    registers            BLOB    NOT NULL,
+                    content_hash         TEXT    NOT NULL,
+                    updated_at           TEXT    NOT NULL,
+                    test_list_confirmed  INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (venue_id, day)
                 );
                 CREATE INDEX IF NOT EXISTS idx_daily_sketch_month
@@ -141,8 +188,24 @@ class Storage:
                     venue_count  INTEGER NOT NULL,
                     updated_at   TEXT    NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS test_ticket_list (
+                    month        TEXT    PRIMARY KEY,
+                    tickets_json TEXT    NOT NULL,
+                    ticket_count INTEGER NOT NULL,
+                    updated_at   TEXT    NOT NULL
+                );
                 """
             )
+            # Databases created before the confirmation flag existed get it
+            # here; CREATE TABLE IF NOT EXISTS cannot add columns.
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(daily_sketch)")
+            }
+            if "test_list_confirmed" not in columns:
+                conn.execute(
+                    "ALTER TABLE daily_sketch "
+                    "ADD COLUMN test_list_confirmed INTEGER NOT NULL DEFAULT 0"
+                )
         finally:
             conn.close()
 
@@ -163,6 +226,23 @@ class Storage:
         finally:
             conn.close()
 
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """One consistent snapshot for several reads, without the write lock.
+
+        In WAL mode a deferred read transaction never blocks writers; every
+        statement below sees the same committed state.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                conn.rollback()  # read-only: just release the snapshot
+        finally:
+            conn.close()
+
     # -- ingest ----------------------------------------------------------
     def ingest(
         self,
@@ -171,6 +251,7 @@ class Storage:
         revision: int,
         p: int,
         registers: Sequence[int],
+        test_list_confirmed: bool = False,
     ) -> IngestOutcome:
         hll.validate_precision(p)
         clean = hll.validate_registers(p, registers)
@@ -179,26 +260,47 @@ class Storage:
 
         with self._write_transaction() as conn:
             existing = conn.execute(
-                "SELECT revision, content_hash FROM daily_sketch "
-                "WHERE venue_id = ? AND day = ?",
+                "SELECT revision, content_hash, test_list_confirmed "
+                "FROM daily_sketch WHERE venue_id = ? AND day = ?",
                 (venue_id, day),
             ).fetchone()
 
             if existing is None:
                 status = "created"
+                stored_confirmation = test_list_confirmed
                 conn.execute(
                     "INSERT INTO daily_sketch "
-                    "(venue_id, day, revision, p, registers, content_hash, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (venue_id, day, revision, p, bytes(clean), fingerprint, utc_now()),
+                    "(venue_id, day, revision, p, registers, content_hash, "
+                    "updated_at, test_list_confirmed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        venue_id,
+                        day,
+                        revision,
+                        p,
+                        bytes(clean),
+                        fingerprint,
+                        utc_now(),
+                        int(test_list_confirmed),
+                    ),
                 )
             elif revision > existing["revision"]:
                 status = "replaced"
+                stored_confirmation = test_list_confirmed
                 conn.execute(
                     "UPDATE daily_sketch SET revision = ?, p = ?, registers = ?, "
-                    "content_hash = ?, updated_at = ? "
+                    "content_hash = ?, updated_at = ?, test_list_confirmed = ? "
                     "WHERE venue_id = ? AND day = ?",
-                    (revision, p, bytes(clean), fingerprint, utc_now(), venue_id, day),
+                    (
+                        revision,
+                        p,
+                        bytes(clean),
+                        fingerprint,
+                        utc_now(),
+                        int(test_list_confirmed),
+                        venue_id,
+                        day,
+                    ),
                 )
             elif revision == existing["revision"]:
                 if existing["content_hash"] == fingerprint:
@@ -210,6 +312,10 @@ class Storage:
                         current_revision=existing["revision"],
                         month=month,
                         summary=self._read_summary(conn, month),
+                        # Nothing was written, so a confirmation carried by an
+                        # idempotent retry is not stored; the stored flag for
+                        # the current revision is reported back unchanged.
+                        test_list_confirmed=bool(existing["test_list_confirmed"]),
                     )
                 raise ConflictError(venue_id, day, revision, existing["revision"])
             else:
@@ -221,6 +327,7 @@ class Storage:
                     current_revision=existing["revision"],
                     month=month,
                     summary=self._read_summary(conn, month),
+                    test_list_confirmed=bool(existing["test_list_confirmed"]),
                 )
 
             summary = self._recompute_month(conn, month)
@@ -232,6 +339,7 @@ class Storage:
                 current_revision=revision,
                 month=month,
                 summary=summary,
+                test_list_confirmed=stored_confirmation,
             )
 
     def _recompute_month(self, conn: sqlite3.Connection, month: str) -> MonthlySummary:
@@ -281,6 +389,27 @@ class Storage:
 
     # -- reads -----------------------------------------------------------
     @staticmethod
+    def _row_to_daily(row: sqlite3.Row) -> DailySketch:
+        p = int(row["p"])
+        registers = list(row["registers"])
+        hll.validate_registers(p, registers)
+        return DailySketch(
+            venue_id=row["venue_id"],
+            day=row["day"],
+            revision=int(row["revision"]),
+            p=p,
+            registers=registers,
+            content_hash=row["content_hash"],
+            updated_at=row["updated_at"],
+            test_list_confirmed=bool(row["test_list_confirmed"]),
+        )
+
+    _DAILY_COLUMNS = (
+        "venue_id, day, revision, p, registers, content_hash, updated_at, "
+        "test_list_confirmed"
+    )
+
+    @staticmethod
     def _read_summary(conn: sqlite3.Connection, month: str) -> MonthlySummary | None:
         row = conn.execute(
             "SELECT month, p, registers, day_count, venue_count, updated_at "
@@ -312,23 +441,102 @@ class Storage:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT venue_id, day, revision, p, registers, content_hash, updated_at "
-                "FROM daily_sketch WHERE venue_id = ? AND day = ?",
+                f"SELECT {self._DAILY_COLUMNS} FROM daily_sketch "
+                "WHERE venue_id = ? AND day = ?",
                 (venue_id, day),
             ).fetchone()
             if row is None:
                 return None
-            p = int(row["p"])
-            registers = list(row["registers"])
-            hll.validate_registers(p, registers)
-            return DailySketch(
-                venue_id=row["venue_id"],
-                day=row["day"],
-                revision=int(row["revision"]),
-                p=p,
-                registers=registers,
-                content_hash=row["content_hash"],
-                updated_at=row["updated_at"],
-            )
+            return self._row_to_daily(row)
         finally:
             conn.close()
+
+    # -- test-swipe list ---------------------------------------------------
+    @staticmethod
+    def _canonical_tickets(tickets: Sequence[str]) -> list[str]:
+        """The stored form of a list: duplicates removed, sorted."""
+        return sorted(set(tickets))
+
+    @staticmethod
+    def _row_to_test_list(row: sqlite3.Row) -> TestList:
+        tickets = json.loads(row["tickets_json"])
+        if not isinstance(tickets, list) or not all(
+            isinstance(ticket, str) for ticket in tickets
+        ):
+            raise RuntimeError(f"corrupt test-swipe list for {row['month']}")
+        return TestList(
+            month=row["month"], tickets=tickets, updated_at=row["updated_at"]
+        )
+
+    def register_test_list(self, month: str, tickets: Sequence[str]) -> TestListOutcome:
+        """Register the month's fixed test-swipe list.
+
+        The list is fixed once registered: re-registering the identical list
+        is idempotent, a different one raises :class:`TestListConflictError`.
+        """
+        canonical = self._canonical_tickets(tickets)
+        payload = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT tickets_json, updated_at FROM test_ticket_list WHERE month = ?",
+                (month,),
+            ).fetchone()
+            if row is None:
+                now = utc_now()
+                conn.execute(
+                    "INSERT INTO test_ticket_list "
+                    "(month, tickets_json, ticket_count, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (month, payload, len(canonical), now),
+                )
+                return TestListOutcome(
+                    status="created",
+                    month=month,
+                    ticket_count=len(canonical),
+                    updated_at=now,
+                )
+            if row["tickets_json"] == payload:
+                return TestListOutcome(
+                    status="unchanged",
+                    month=month,
+                    ticket_count=len(canonical),
+                    updated_at=row["updated_at"],
+                )
+            raise TestListConflictError(month)
+
+    def get_test_list(self, month: str) -> TestList | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT month, tickets_json, updated_at FROM test_ticket_list "
+                "WHERE month = ?",
+                (month,),
+            ).fetchone()
+            return self._row_to_test_list(row) if row is not None else None
+        finally:
+            conn.close()
+
+    # -- audit ---------------------------------------------------------------
+    def get_audit_snapshot(self, month: str) -> AuditSnapshot:
+        """Read summary, current dailies, and test list from one snapshot.
+
+        Everything is read inside a single deferred read transaction, so the
+        audit verdict and the monthly report it may release are computed from
+        the same committed data.  No write lock is taken.
+        """
+        start, end = f"{month}-01", f"{next_month(month)}-01"
+        with self._read_transaction() as conn:
+            summary = self._read_summary(conn, month)
+            rows = conn.execute(
+                f"SELECT {self._DAILY_COLUMNS} FROM daily_sketch "
+                "WHERE day >= ? AND day < ? ORDER BY day, venue_id",
+                (start, end),
+            ).fetchall()
+            dailies = [self._row_to_daily(row) for row in rows]
+            row = conn.execute(
+                "SELECT month, tickets_json, updated_at FROM test_ticket_list "
+                "WHERE month = ?",
+                (month,),
+            ).fetchone()
+            test_list = self._row_to_test_list(row) if row is not None else None
+        return AuditSnapshot(summary=summary, dailies=dailies, test_list=test_list)

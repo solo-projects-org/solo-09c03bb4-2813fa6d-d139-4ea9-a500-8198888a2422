@@ -147,7 +147,7 @@ def test_parallel_backfill_through_http(client):
                 day=f"2026-04-{n + 1:02d}",
             )
             assert client.post("/api/v1/daily-sketches", json=body).status_code == 200
-        except BaseException as exc:  # pragma: no cover
+        except BaseException as exc:  # noqa: BLE001  # pragma: no cover
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
